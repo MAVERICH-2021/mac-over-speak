@@ -1,4 +1,5 @@
 import torch
+import gc
 from qwen_asr import Qwen3ASRModel
 
 ASR_MODEL_PATH = "Qwen/Qwen3-ASR-1.7B"
@@ -45,12 +46,35 @@ class ASREngine:
         if self.model is None:
             self.load_model()
         
-        # audio_data can be a file path, bytes, or (wav, sr)
-        results = self.model.transcribe(
-            audio=audio_data,
-            language=language,
-            return_time_stamps=False,
-        )
-        return results[0] if results else None
+        try:
+            # audio_data can be a file path, bytes, or (wav, sr)
+            # We explicitly pass context="" to ensure no history is kept
+            # Qwen3-ASR is a multi-modal model, so it *could* have context,
+            # but we want to stay lean.
+            with torch.inference_mode():
+                results = self.model.transcribe(
+                    audio=audio_data,
+                    context="",
+                    language=language,
+                    return_time_stamps=False,
+                )
+            return results[0] if results else None
+        finally:
+            # Memory Management: Force cleanup after each transcription
+            # This is crucial for MPS (Metal) on Mac which tends to hold onto memory
+            self.clear_memory()
+
+    def clear_memory(self):
+        """Force garbage collection and clear GPU cache."""
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        elif torch.backends.mps.is_available():
+            # Crucial for preventing the 7GB -> 12GB growth on Mac
+            try:
+                torch.mps.empty_cache()
+            except:
+                pass
+        print("DEBUG: Memory cleared.")
 
 asr_engine = ASREngine()

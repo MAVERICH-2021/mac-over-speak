@@ -51,6 +51,7 @@
 
 ## 7 remove 快捷键支持按键设置监听功能 只支持打字设置
 - [x] 但是要user friendly <f12> 这种就不好 要让用户可以直接从现成的按键选项中选择 比如用户点击的时候就弹出常见的按键chip choice, 用户如果输入 则filter相关chip
+- [ ] 彻底删除所有 indicator。
 
 # Problems
 

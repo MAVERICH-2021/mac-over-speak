@@ -97,6 +97,17 @@ def warmup_view(request):
     except Exception as e:
         return JsonResponse({'error': str(e)}, status=500)
 
+@csrf_exempt
+def clear_view(request):
+    """
+    Manually trigger memory cleanup and ensure next request is fresh.
+    """
+    try:
+        asr_engine.clear_memory()
+        return JsonResponse({'status': 'memory_cleared'})
+    except Exception as e:
+        return JsonResponse({'error': str(e)}, status=500)
+
 def status_view(request):
     """
     Check if the backend is running.
