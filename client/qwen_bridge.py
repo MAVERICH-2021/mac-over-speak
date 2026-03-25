@@ -11,6 +11,7 @@ import tkinter as tk
 from tkinter import ttk
 
 import numpy as np
+import plistlib
 import requests
 import rumps
 import scipy.io.wavfile as wav
@@ -217,21 +218,20 @@ class ASRClient:
             self.canvas.itemconfig(self.lang_text, text=text)
 
     def get_current_input_language(self):
-        """Detect current macOS input method language."""
+        """Detect current macOS input method language by reading system plist directly."""
         try:
-            # Query the global AppleSelectedInputSources to detect the system-level input method.
-            result = subprocess.run(
-                [
-                    "defaults",
-                    "read",
-                    "com.apple.HIToolbox",
-                    "AppleSelectedInputSources",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=1,
-            )
-            output = result.stdout
+            # Read the plist file directly instead of spawning a 'defaults' process.
+            # This is much faster and avoids Mach port messaging errors.
+            plist_path = os.path.expanduser("~/Library/Preferences/com.apple.HIToolbox.plist")
+            if not os.path.exists(plist_path):
+                return "en"
+
+            with open(plist_path, "rb") as f:
+                pl = plistlib.load(f)
+            
+            selected_sources = pl.get("AppleSelectedInputSources", [])
+            output = str(selected_sources)
+
             if any(
                 x in output
                 for x in [
@@ -260,7 +260,27 @@ class ASRClient:
                 return "ja"
             return "en"
         except Exception as e:
-            return "en"  # Default to en if not clearly zh
+            # Fallback to subprocess if plist reading fails for any reason
+            try:
+                result = subprocess.run(
+                    [
+                        "defaults",
+                        "read",
+                        "com.apple.HIToolbox",
+                        "AppleSelectedInputSources",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=1,
+                )
+                output = result.stdout
+                if "SCIM" in output or "Pinyin" in output or "Chinese" in output:
+                    return "zh"
+                if "Japanese" in output or "Kotoeri" in output:
+                    return "ja"
+            except:
+                pass
+            return "en"
 
     def start_ipc_server(self):
         # Create a custom handler class that can access the ASRClient instance
