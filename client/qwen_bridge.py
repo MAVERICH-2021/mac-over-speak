@@ -221,27 +221,27 @@ class ASRClient:
     def language_polling_loop(self):
         def _loop():
             while True:
+                is_preparing = getattr(self, "llm_status", "") in ["Starting...", "Warming up..."]
                 lang = self.get_current_input_language()
-                if lang != getattr(self, "current_language_ui", None):
-                    self.current_language_ui = lang
+                
+                # We want to trigger when lang changes OR when preparing (for animation)
+                if lang != getattr(self, "current_language_ui", None) or is_preparing:
+                    # Don't update current_language_ui here, let _set_lang_text do it
+                    # so that we detect the change correctly in the next loop
                     self.queue_task(lambda l=lang: self._set_lang_text(l))
+                
+                # Faster polling for more immediate response
                 time.sleep(
-                    0.5
-                    if self.is_recording or getattr(self, "is_processing", False)
-                    else 1.5
+                    0.15 
+                    if self.is_recording or getattr(self, "is_processing", False) or is_preparing
+                    else 0.35
                 )
 
         threading.Thread(target=_loop, daemon=True).start()
 
     def _set_lang_text(self, lang):
-        if lang == "zh":
-            text = "中"
-        elif lang == "ja":
-            text = "日"
-        else:
-            text = "英"
-        if hasattr(self, "lang_text"):
-            self.canvas.itemconfig(self.lang_text, text=text)
+        self.current_language_ui = lang
+        self.update_tray_status(getattr(self, "current_ui_state", "HIDE"))
 
     def get_current_input_language(self):
         """Detect current macOS input method language by reading system plist directly."""
@@ -259,28 +259,29 @@ class ASRClient:
             output = str(selected_sources)
 
             if any(
-                x in output
+                x.lower() in output.lower()
                 for x in [
-                    "SCIM",
-                    "ITABC",
-                    "Pinyin",
-                    "Wubi",
-                    "Zhuyin",
-                    "Cangjie",
-                    "Stroke",
-                    "Chinese",
+                    "scim",
+                    "itabc",
+                    "pinyin",
+                    "wubi",
+                    "zhuyin",
+                    "cangjie",
+                    "stroke",
+                    "chinese",
+                    "pinyin.simplified",
                 ]
             ):
                 return "zh"
             if any(
-                x in output
+                x.lower() in output.lower()
                 for x in [
-                    "Kotoeri",
-                    "Japanese",
-                    "Romaji",
-                    "Kana",
-                    "Hiragana",
-                    "Katakana",
+                    "kotoeri",
+                    "japanese",
+                    "romaji",
+                    "kana",
+                    "hiragana",
+                    "katakana",
                 ]
             ):
                 return "ja"
@@ -415,82 +416,18 @@ class ASRClient:
                 self.llm_status = "Offline"
                 print("LLM Warm-up failed or timed out.")
             self.queue_task(self.update_rumps_menu)
+            self.queue_task(lambda: self.update_tray_status(getattr(self, "current_ui_state", "HIDE")))
 
         threading.Thread(target=_warmup, daemon=True).start()
 
     def setup_ui(self):
         self.root = tk.Tk()
         self.root.withdraw()
-
-        self.indicator = tk.Toplevel(self.root, takefocus=0)
-        self.indicator.title("ASR_DOT")
-        self.indicator.overrideredirect(True)
-        self.indicator.attributes("-topmost", True)
-
-        try:
-            # Safely access the Tk widget ID, with fallback for different environments
-            widget_id = getattr(self.indicator, "_w", None)
-            if widget_id is not None:
-                self.indicator.tk.call(
-                    "::tk::unsupported::MacWindowStyle",
-                    "style",
-                    widget_id,
-                    "help",
-                    "no-shadow",
-                )
-            else:
-                # Alternative approach if _w is not available
-                self.indicator.tk.call(
-                    "::tk::unsupported::MacWindowStyle",
-                    "style",
-                    str(self.indicator.winfo_id()),
-                    "help",
-                    "no-shadow",
-                )
-        except:
-            pass
-
-        self.indicator.attributes("-alpha", 0.0)
-        self.ind_w = 48
-        self.ind_h = 24
-        self.indicator.geometry(f"{self.ind_w}x{self.ind_h}+0+0")
-
-        self.indicator.config(bg="#3a3a3c")
-
-        self.canvas = tk.Canvas(
-            self.indicator,
-            width=self.ind_w,
-            height=self.ind_h,
-            highlightthickness=0,
-            borderwidth=0,
-            bg="#3a3a3c",
-        )
-        self.canvas.pack()
-
-        # Draw status dot
-        dot_r = 5
-        self.dot = self.canvas.create_oval(
-            7,
-            self.ind_h / 2 - dot_r,
-            7 + dot_r * 2,
-            self.ind_h / 2 + dot_r,
-            fill="#FF3B30",
-            outline="",
-        )
-
-        # Draw language text (e.g. 中 / 英)
-        self.lang_text = self.canvas.create_text(
-            24,
-            self.ind_h / 2,
-            text="中",
-            fill="white",
-            font=("System", 13, "bold"),
-            anchor="w",
-        )
+        self.current_ui_state = "HIDE"
         self.current_language_ui = "zh"
 
     def setup_rumps(self):
-        self.app = rumps.App("MacOverSpeak", template=True)
+        self.app = rumps.App("MacOverSpeak", template=False)
         self.update_rumps_menu()
         self.update_rumps_icon("HIDE")
 
@@ -580,21 +517,93 @@ class ASRClient:
 
         threading.Thread(target=_clear, daemon=True).start()
 
-    def update_rumps_icon(self, state):
+    def update_rumps_icon(self, state, lang=None):
+        if lang is None:
+            lang = getattr(self, "current_language_ui", "zh")
+
+        # Preparing state (Warming up)
+        is_ready = getattr(self, "llm_status", "") == "Ready"
+        is_preparing = getattr(self, "llm_status", "") in ["Starting...", "Warming up..."]
+        
         colors = {
             "REC": "#FF3B30",
             "PROC": "#FFCC00",
             "TYPE": "#34C759",
-            "HIDE": "#AAAAAA",
+            "HIDE": "#FFFFFF" if is_ready else "#AAAAAA",
         }
         color = colors.get(state, "#AAAAAA")
         # Generate a small image for the icon
-        width, height = 32, 32
+        # Size 44x44 for higher DPI support internally by rumps
+        width, height = 44, 44
         image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
         dc = ImageDraw.Draw(image)
-        dc.ellipse([4, 4, 28, 28], fill=color)
 
-        temp_icon = os.path.join(os.path.expanduser("~"), ".mac_over_speak_icon.png")
+        # Draw main circle
+        dc.ellipse([2, 2, 42, 42], fill=color)
+
+        if state == "HIDE" and is_preparing:
+            # Draw circular loading indicator
+            angle = getattr(self, "loading_angle", 0)
+            self.loading_angle = (angle + 36) % 360 # Smaller steps for smoother animation
+            # Draw rotating arc
+            dc.arc([10, 10, 34, 34], start=angle, end=angle+300, fill="white", width=4)
+            
+            # Force rumps to refresh by using alternating icon paths
+            icon_index = getattr(self, "_icon_refresh_toggle", 0)
+            self._icon_refresh_toggle = (icon_index + 1) % 2
+            temp_icon = os.path.join(os.path.expanduser("~"), f".mac_over_speak_icon_{icon_index}.png")
+            
+            image.save(temp_icon)
+            self.app.icon = temp_icon
+            return
+
+        # Draw language text
+        # Mapping lang code to display character
+        lang_char = {"zh": "中", "ja": "日", "en": "英"}.get(lang, "英")
+
+        from PIL import ImageFont
+        try:
+            # Try to find a system font that supports CJK
+            font_paths = [
+                "/System/Library/Fonts/PingFang.ttc",
+                "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+                "/System/Library/Fonts/STHeiti Light.ttc",
+                "/Library/Fonts/Arial Unicode.ttf",
+            ]
+            font = None
+            for path in font_paths:
+                if os.path.exists(path):
+                    font = ImageFont.truetype(path, 28)
+                    break
+            if not font:
+                font = ImageFont.load_default()
+        except:
+            font = ImageFont.load_default()
+
+        # Calculate text position (center of icon)
+        try:
+            # Pillow 9.2.0+ uses getbbox/getlabel
+            left, top, right, bottom = dc.textbbox((0, 0), lang_char, font=font)
+            text_w = right - left
+            text_h = bottom - top
+            x = (width - text_w) / 2
+            y = (height - text_h) / 2 - top # Offset by top to better center vertically
+        except AttributeError:
+            # Older Pillow
+            text_w, text_h = dc.textsize(lang_char, font=font)
+            x = (width - text_w) / 2
+            y = (height - text_h) / 2
+
+        # Draw character in white for visibility on colors, or black on yellow/white
+        is_light_bg = state in ["PROC", "TYPE"] or (state == "HIDE" and is_ready)
+        text_color = "black" if is_light_bg else "white"
+        dc.text((x, y), lang_char, font=font, fill=text_color)
+
+        # Force rumps to refresh by using alternating icon paths (bypass cache)
+        icon_index = getattr(self, "_icon_refresh_toggle", 0)
+        self._icon_refresh_toggle = (icon_index + 1) % 2
+        temp_icon = os.path.join(os.path.expanduser("~"), f".mac_over_speak_icon_{icon_index}.png")
+        
         image.save(temp_icon)
         self.app.icon = temp_icon
 
@@ -612,7 +621,7 @@ class ASRClient:
         self.warmup_llm()
 
     def update_tray_status(self, state):
-        self.update_rumps_icon(state)
+        self.update_rumps_icon(state, lang=self.current_language_ui)
 
     def start_hotkey_listener(self):
         if self.hotkey_listener:
@@ -662,19 +671,8 @@ class ASRClient:
         self.queue_task(lambda: self._update_ui_internal(state))
 
     def _update_ui_internal(self, state):
-        themes = {
-            "REC": "#FF3B30",
-            "PROC": "#FFCC00",
-            "TYPE": "#34C759",
-        }
-        if state in themes:
-            self.canvas.itemconfig(self.dot, fill=themes[state])
-            self.indicator.attributes("-alpha", 0.95)
-            self.update_tray_status(state)
-        else:
-            self.indicator.attributes("-alpha", 0.0)
-            self.update_tray_status("HIDE")
-        self.indicator.update_idletasks()
+        self.current_ui_state = state
+        self.update_tray_status(state)
 
     def start_recording(self):
         if self.is_recording:
