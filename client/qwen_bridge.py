@@ -550,13 +550,17 @@ class ASRClient:
         project_root = get_bundle_dir()
         start_sh = os.path.join(project_root, "start.sh")
         
+        # Use single quotes for shell and shlex-like safety
         if getattr(sys, "frozen", False):
-            script = f"sleep 1; open \\\"{sys.executable}\\\""
+            # For bundled app
+            script = f"sleep 1; open '{sys.executable}'"
         else:
             if os.path.exists(start_sh):
-                script = f"sleep 1; bash \\\"{start_sh}\\\""
+                # When running from source, it's safer to cd first
+                script = f"sleep 1; cd '{project_root}'; bash start.sh"
             else:
-                script = f"sleep 1; \\\"{sys.executable}\\\" \\\"{__file__}\\\""
+                # Fallback to direct python script run
+                script = f"sleep 1; cd '{project_root}'; '{sys.executable}' '{__file__}'"
                 
         subprocess.Popen(script, shell=True, start_new_session=True)
         self.on_closing()
