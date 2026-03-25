@@ -1,12 +1,95 @@
-import torch
 import gc
+import os
+import threading
+import time
+
+import psutil
+import torch
 from qwen_asr import Qwen3ASRModel
 
 ASR_MODEL_PATH = "Qwen/Qwen3-ASR-1.7B"
-FORCED_ALIGNER_PATH = "Qwen/Qwen3-ForcedAligner-0.6B"
+_PROCESS = psutil.Process(os.getpid())
 
-# A singleton class that handles loading the Qwen3ASRModel and Qwen3ForcedAligner once 
-# and reusing them for all requests.
+
+def _resolve_device():
+    requested = os.getenv("ASR_DEVICE", "auto").strip().lower()
+    if requested and requested != "auto":
+        return requested
+
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def _resolve_dtype():
+    dtype_name = os.getenv("ASR_DTYPE", "bfloat16").strip().lower()
+    dtype_map = {
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+        "float32": torch.float32,
+    }
+    return dtype_map.get(dtype_name, torch.bfloat16)
+
+
+def _resolve_reset_every_n():
+    raw = os.getenv("ASR_RESET_EVERY_N_REQUESTS", "0").strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
+
+
+def _bytes_to_mb(value):
+    if value is None:
+        return None
+    return round(value / (1024 * 1024), 1)
+
+
+def _safe_mps_bytes(func_name):
+    func = getattr(torch.mps, func_name, None)
+    if func is None:
+        return None
+    try:
+        return func()
+    except Exception:
+        return None
+
+
+def _memory_snapshot():
+    rss = None
+    try:
+        rss = _PROCESS.memory_info().rss
+    except Exception:
+        pass
+
+    snapshot = {
+        "rss_mb": _bytes_to_mb(rss),
+        "mps_allocated_mb": None,
+        "mps_driver_mb": None,
+    }
+
+    if torch.backends.mps.is_available():
+        snapshot["mps_allocated_mb"] = _bytes_to_mb(
+            _safe_mps_bytes("current_allocated_memory")
+        )
+        snapshot["mps_driver_mb"] = _bytes_to_mb(
+            _safe_mps_bytes("driver_allocated_memory")
+        )
+
+    return snapshot
+
+
+def _memory_delta(before, after):
+    delta = {}
+    for key, value in after.items():
+        old = before.get(key)
+        delta[key] = None if old is None or value is None else round(value - old, 1)
+    return delta
+
+
+# A singleton class that loads the ASR backend once and reuses it for all requests.
 class ASREngine:
     _instance = None
 
@@ -14,43 +97,73 @@ class ASREngine:
         if cls._instance is None:
             cls._instance = super(ASREngine, cls).__new__(cls)
             cls._instance.model = None
+            cls._instance.backend = (
+                os.getenv("ASR_BACKEND", "transformers").strip().lower()
+            )
+            cls._instance.device = _resolve_device()
+            cls._instance.dtype = _resolve_dtype()
+            cls._instance.reset_every_n = _resolve_reset_every_n()
+            cls._instance.transcribe_count = 0
+            cls._instance._load_lock = threading.Lock()
         return cls._instance
 
     def load_model(self):
         if self.model is not None:
             return
 
-        print("Loading Qwen3-ASR Model...")
-        if torch.cuda.is_available():
-            device = "cuda"
-        elif torch.backends.mps.is_available():
-            device = "mps"
-        else:
-            device = "cpu"
+        with self._load_lock:
+            if self.model is not None:
+                return
 
-        self.model = Qwen3ASRModel.from_pretrained(
-            ASR_MODEL_PATH,
-            dtype=torch.bfloat16,
-            device_map=device,
-            forced_aligner=FORCED_ALIGNER_PATH,
-            forced_aligner_kwargs=dict(
-                dtype=torch.bfloat16,
-                device_map=device,
-            ),
-            max_inference_batch_size=32,
-            max_new_tokens=256,
-        )
-        print(f"Model loaded on {device}")
+            before = _memory_snapshot()
+            started_at = time.perf_counter()
+            print(
+                f"Loading Qwen3-ASR model with backend={self.backend} "
+                f"device={self.device} dtype={self.dtype}..."
+            )
+
+            if self.backend == "mlx":
+                raise RuntimeError(
+                    "ASR_BACKEND=mlx was requested, but the installed qwen-asr package "
+                    "does not provide an MLX inference backend in this project yet."
+                )
+
+            if self.backend != "transformers":
+                raise RuntimeError(
+                    f"Unsupported ASR_BACKEND '{self.backend}'. Supported backends: transformers, mlx."
+                )
+
+            model_kwargs = {
+                "dtype": self.dtype,
+                "device_map": self.device,
+                "max_inference_batch_size": 32,
+                "max_new_tokens": 256,
+            }
+
+            # Timestamps are disabled in this app, so we intentionally avoid loading
+            # the 0.6B forced aligner model to keep startup memory lower.
+            self.model = Qwen3ASRModel.from_pretrained(
+                ASR_MODEL_PATH,
+                **model_kwargs,
+            )
+            after = _memory_snapshot()
+            elapsed = round(time.perf_counter() - started_at, 3)
+            print(
+                "DEBUG: Model loaded "
+                f"on {self.device} in {elapsed}s; before={before} after={after} "
+                f"delta={_memory_delta(before, after)}"
+            )
 
     def transcribe(self, audio_data, language=None):
         if self.model is None:
             self.load_model()
-        
+
+        results = None
+        before = _memory_snapshot()
+        started_at = time.perf_counter()
         try:
             # audio_data can be a file path, bytes, or (wav, sr)
-            # We explicitly pass context="" to ensure no history is kept
-            # Qwen3-ASR is a multi-modal model, so it *could* have context,
-            # but we want to stay lean.
+            # We explicitly pass context="" to ensure no history is kept.
             with torch.inference_mode():
                 results = self.model.transcribe(
                     audio=audio_data,
@@ -58,11 +171,27 @@ class ASREngine:
                     language=language,
                     return_time_stamps=False,
                 )
-            return results[0] if results else None
+            result = results[0] if results else None
+            self.transcribe_count += 1
+            return result
         finally:
-            # Memory Management: Force cleanup after each transcription
-            # This is crucial for MPS (Metal) on Mac which tends to hold onto memory
+            if results is not None:
+                del results
+            # MPS tends to retain cache aggressively, so clear after each request.
             self.clear_memory()
+            after = _memory_snapshot()
+            elapsed = round(time.perf_counter() - started_at, 3)
+            print(
+                "DEBUG: Transcribe finished "
+                f"in {elapsed}s; before={before} after={after} "
+                f"delta={_memory_delta(before, after)} count={self.transcribe_count}"
+            )
+            if self.reset_every_n and self.transcribe_count >= self.reset_every_n:
+                print(
+                    f"Resetting ASR model after {self.transcribe_count} requests "
+                    "to cap long-running memory growth (Background reload enabled)."
+                )
+                self.reset_model(reload=True)
 
     def clear_memory(self):
         """Force garbage collection and clear GPU cache."""
@@ -70,11 +199,28 @@ class ASREngine:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         elif torch.backends.mps.is_available():
-            # Crucial for preventing the 7GB -> 12GB growth on Mac
             try:
                 torch.mps.empty_cache()
-            except:
+            except Exception:
                 pass
         print("DEBUG: Memory cleared.")
+
+    def reset_model(self, reload=False):
+        """Unload the model so memory can drop back before the next request."""
+        before = _memory_snapshot()
+        if self.model is not None:
+            self.model = None
+        self.transcribe_count = 0
+        self.clear_memory()
+        after = _memory_snapshot()
+        print(
+            f"DEBUG: Model unloaded; before={before} after={after} "
+            f"delta={_memory_delta(before, after)}"
+        )
+        
+        if reload:
+            print("DEBUG: Triggering background model reload...")
+            threading.Thread(target=self.load_model, daemon=True).start()
+
 
 asr_engine = ASREngine()

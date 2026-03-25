@@ -1,5 +1,7 @@
 import os
 import tempfile
+import time
+import uuid
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from .asr_engine import asr_engine
@@ -57,34 +59,51 @@ def transcribe_view(request):
         "mk": "Macedonian",
     }
     target_language = lang_map.get(language.lower(), language) if language else None
-    print(f"DEBUG: Processing request with language code '{language}' mapped to '{target_language}'")
+    request_id = uuid.uuid4().hex[:8]
+    started_at = time.perf_counter()
+    print(
+        f"DEBUG: [{request_id}] Processing request with language code "
+        f"'{language}' mapped to '{target_language}'"
+    )
 
+    tmp_path = None
     try:
         # Save uploaded file to a temporary location
         with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(audio_file.name)[1]) as tmp:
             for chunk in audio_file.chunks():
                 tmp.write(chunk)
             tmp_path = tmp.name
+        file_size = os.path.getsize(tmp_path)
+        print(f"DEBUG: [{request_id}] Temp audio saved to {tmp_path} ({file_size} bytes)")
 
         # Transcribe
         result = asr_engine.transcribe(tmp_path, language=target_language)
 
-        # Cleanup
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-
         if result:
+            elapsed = round(time.perf_counter() - started_at, 3)
+            print(
+                f"DEBUG: [{request_id}] Request completed in {elapsed}s "
+                f"with {len(result.text)} chars"
+            )
             return JsonResponse({
                 'text': result.text,
                 'language': result.language,
             })
         else:
+            elapsed = round(time.perf_counter() - started_at, 3)
+            print(f"DEBUG: [{request_id}] Request failed after {elapsed}s: empty result")
             return JsonResponse({'error': 'Transcription failed'}, status=500)
 
     except Exception as e:
         import traceback
         traceback.print_exc()
+        elapsed = round(time.perf_counter() - started_at, 3)
+        print(f"DEBUG: [{request_id}] Request raised after {elapsed}s: {e}")
         return JsonResponse({'error': str(e)}, status=500)
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+            print(f"DEBUG: [{request_id}] Temp audio removed")
 
 @csrf_exempt
 def warmup_view(request):
@@ -100,11 +119,11 @@ def warmup_view(request):
 @csrf_exempt
 def clear_view(request):
     """
-    Manually trigger memory cleanup and ensure next request is fresh.
+    Unload the current model so memory can drop before the next request.
     """
     try:
-        asr_engine.clear_memory()
-        return JsonResponse({'status': 'memory_cleared'})
+        asr_engine.reset_model()
+        return JsonResponse({'status': 'model_unloaded'})
     except Exception as e:
         return JsonResponse({'error': str(e)}, status=500)
 

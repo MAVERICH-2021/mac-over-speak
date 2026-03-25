@@ -1,6 +1,7 @@
 import http.server
 import json
 import os
+import signal
 import queue
 import socketserver
 import subprocess
@@ -171,6 +172,8 @@ class ASRClient:
         self.shift_key_listener = None
         self.last_shift_press_time = 0
         self.backend_process = None
+        self.external_backend_pid = self._read_external_backend_pid()
+        self._is_closing = False
 
         # UI State
         self.llm_status = "Starting..."
@@ -191,6 +194,29 @@ class ASRClient:
         # Start LLM warm-up immediately instead of waiting for settings
         # This must be called AFTER setup_rumps because it updates the rumps menu
         self.warmup_llm()
+
+    def _read_external_backend_pid(self):
+        raw_pid = os.environ.get("MAC_OVER_SPEAK_API_PID", "").strip()
+        if not raw_pid:
+            return None
+
+        try:
+            return int(raw_pid)
+        except ValueError:
+            print(f"Ignoring invalid MAC_OVER_SPEAK_API_PID: {raw_pid}")
+            return None
+
+    def _terminate_pid(self, pid, label):
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return
+
+        try:
+            os.kill(pid, signal.SIGTERM)
+            print(f"{label} terminated (PID: {pid}).")
+        except OSError as e:
+            print(f"Failed to terminate {label} PID {pid}: {e}")
 
     def language_polling_loop(self):
         def _loop():
@@ -501,7 +527,12 @@ class ASRClient:
         )
         self.app.menu.add(
             rumps.MenuItem(
-                "Clear ASR Context", callback=lambda _: self.clear_asr_context()
+                "Clear ASR Memory", callback=lambda _: self.clear_asr_context()
+            )
+        )
+        self.app.menu.add(
+            rumps.MenuItem(
+                "Hard Restart Service", callback=lambda _: self.queue_task(self.hard_restart)
             )
         )
         self.app.menu.add(
@@ -512,6 +543,24 @@ class ASRClient:
         self.app.menu.add(None)
         self.app.menu.add(rumps.MenuItem("Quit", callback=lambda _: self.on_closing()))
 
+    def hard_restart(self):
+        print("Hard restarting service...")
+        import subprocess
+        
+        project_root = get_bundle_dir()
+        start_sh = os.path.join(project_root, "start.sh")
+        
+        if getattr(sys, "frozen", False):
+            script = f"sleep 1; open \\\"{sys.executable}\\\""
+        else:
+            if os.path.exists(start_sh):
+                script = f"sleep 1; bash \\\"{start_sh}\\\""
+            else:
+                script = f"sleep 1; \\\"{sys.executable}\\\" \\\"{__file__}\\\""
+                
+        subprocess.Popen(script, shell=True, start_new_session=True)
+        self.on_closing()
+
     def clear_asr_context(self):
         def _clear():
             try:
@@ -519,8 +568,8 @@ class ASRClient:
                 if not clear_url:
                     clear_url = "http://127.0.0.1:8333/clear/"
                 requests.get(clear_url, timeout=10)
-                print("ASR context and memory cleared.")
-                rumps.notification("MacOverSpeak", "Success", "ASR Context Cleared")
+                print("ASR model unloaded and memory cleared.")
+                rumps.notification("MacOverSpeak", "Success", "ASR Memory Cleared")
             except Exception as e:
                 print(f"Clear Context Error: {e}")
                 rumps.notification("MacOverSpeak", "Error", f"Failed to clear context: {e}")
@@ -665,7 +714,7 @@ class ASRClient:
             if hasattr(self, "stream") and self.stream:
                 try:
                     print("[Stream] Stopping and closing stream...")
-                    self.stream.stop()
+                    self.stream.abort()
                     self.stream.close()
                 except Exception as e:
                     print(f"[Stream] Error closing stream: {e}")
@@ -684,9 +733,9 @@ class ASRClient:
             self.is_processing = False
             self.set_ui("HIDE")
             return
-        
+
+        temp_file = os.path.join(os.path.expanduser("~"), "input_asr.wav")
         try:
-            temp_file = os.path.join(os.path.expanduser("~"), "input_asr.wav")
             wav_data = np.concatenate(self.audio_data)
             wav.write(temp_file, self.config.get("sample_rate"), wav_data)
 
@@ -719,6 +768,13 @@ class ASRClient:
             print(f"[Inference] Error: {e}")
             self.is_processing = False
             self.set_ui("HIDE")
+        finally:
+            self.audio_data = []
+            try:
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+            except Exception:
+                pass
 
     def _paste_text_background(self, text):
         def _paste_worker():
@@ -749,17 +805,23 @@ class ASRClient:
         self.set_ui("HIDE")
 
     def on_closing(self):
+        if self._is_closing:
+            return
+        self._is_closing = True
+
         print("Shutting down...")
         if self.backend_process:
             try:
                 self.backend_process.terminate()
-                print("Backend terminated.")
-            except:
-                pass
+                print(f"Backend terminated (PID: {self.backend_process.pid}).")
+            except Exception as e:
+                print(f"Failed to terminate backend subprocess: {e}")
+        elif self.external_backend_pid:
+            self._terminate_pid(self.external_backend_pid, "API service")
 
         try:
             self.root.destroy()
-        except:
+        except Exception:
             pass
 
         rumps.quit_application()
