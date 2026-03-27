@@ -7,7 +7,9 @@ import psutil
 import torch
 from qwen_asr import Qwen3ASRModel
 
-ASR_MODEL_PATH = "Qwen/Qwen3-ASR-1.7B"
+ASR_REPO_ID = "Qwen/Qwen3-ASR-1.7B"
+LOCAL_MODEL_DIR = "/Users/wennuan/storage/models/Qwen3-ASR-1.7B"
+
 _PROCESS = psutil.Process(os.getpid())
 
 
@@ -142,10 +144,33 @@ class ASREngine:
 
             # Timestamps are disabled in this app, so we intentionally avoid loading
             # the 0.6B forced aligner model to keep startup memory lower.
-            self.model = Qwen3ASRModel.from_pretrained(
-                ASR_MODEL_PATH,
-                **model_kwargs,
-            )
+            try:
+                from huggingface_hub import snapshot_download
+                # 1. 检查本地目录是否存在或为空
+                model_already_on_disk = os.path.isdir(LOCAL_MODEL_DIR) and len(os.listdir(LOCAL_MODEL_DIR)) > 3
+                
+                if not model_already_on_disk:
+                    print(f"Model not found at {LOCAL_MODEL_DIR}. Downloading from HF Hub...")
+                    # 确保父目录存在
+                    os.makedirs(os.path.dirname(LOCAL_MODEL_DIR), exist_ok=True)
+                    # 下载到指定的本地目录
+                    snapshot_download(
+                        repo_id=ASR_REPO_ID,
+                        local_dir=LOCAL_MODEL_DIR,
+                        local_dir_use_symlinks=False # 直接保存文件，方便查看
+                    )
+                
+                print(f"Loading ASR model from dedicated local path: {LOCAL_MODEL_DIR}")
+                self.model = Qwen3ASRModel.from_pretrained(
+                    LOCAL_MODEL_DIR,
+                    **model_kwargs,
+                    trust_remote_code=True,
+                    local_files_only=True
+                )
+            except Exception as e:
+                # Catch-all for loading errors (e.g., corrupted files)
+                print(f"ERROR: Failed to load ASR model from {LOCAL_MODEL_DIR}: {e}")
+                raise
             after = _memory_snapshot()
             elapsed = round(time.perf_counter() - started_at, 3)
             print(
